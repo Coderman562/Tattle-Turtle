@@ -146,6 +146,7 @@ export default function App() {
   const [teacherAlerts, setTeacherAlerts] = useState<TeacherAlert[]>([]);
   const [teacherDashboardToast, setTeacherDashboardToast] = useState<string | null>(null);
   const [studentNotice, setStudentNotice] = useState<string | null>(null);
+  const [hideNeedTeacherButton, setHideNeedTeacherButton] = useState(false);
 
   // Audio Context Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -282,7 +283,7 @@ export default function App() {
     alertSentThisSessionRef.current = true;
   };
 
-  const startVoiceSession = async (customGreeting?: string) => {
+  const startVoiceSession = async (customGreeting?: string, resumedFromYellow = false) => {
     setError(null);
     isEndingSessionRef.current = false;
     forceTeacherEscalationRef.current = false;
@@ -290,6 +291,7 @@ export default function App() {
     yellowAlertSentThisSessionRef.current = false;
     setTeacherContactStatus(null);
     setStudentNotice(null);
+    setHideNeedTeacherButton(resumedFromYellow);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
@@ -552,13 +554,14 @@ export default function App() {
     setNeedsEscalationConfirmation(false);
     setTeacherContactStatus(null);
     setStudentNotice(null);
+    setHideNeedTeacherButton(false);
     conversationHistoryRef.current = '';
   };
 
   const resumeConversation = () => {
     const followUp = state.response?.followUpQuestion;
     setState(prev => ({ ...prev, step: 'VOICE_CHAT', response: null }));
-    startVoiceSession(followUp);
+    startVoiceSession(followUp, state.response?.urgency === UrgencyLevel.YELLOW);
   };
 
   const confirmEscalation = (confirmed: boolean) => {
@@ -735,16 +738,18 @@ export default function App() {
             >
               I'm All Done!
             </button>
-            <button
-              onClick={() => {
-                forceTeacherEscalationRef.current = true;
-                triggerImmediateTeacherAlert('Student pressed Need Teacher Now.');
-                endVoiceSession();
-              }}
-              className="bubbly-button bg-[var(--soft-coral)] hover:opacity-90 text-white text-4xl font-bubble py-7 px-16 shadow-lg transform transition-hover active:scale-95"
-            >
-              Need Teacher Now
-            </button>
+            {!hideNeedTeacherButton && (
+              <button
+                onClick={() => {
+                  forceTeacherEscalationRef.current = true;
+                  triggerImmediateTeacherAlert('Student pressed Need Teacher Now.');
+                  endVoiceSession();
+                }}
+                className="bubbly-button bg-[var(--soft-coral)] hover:opacity-90 text-white text-4xl font-bubble py-7 px-16 shadow-lg transform transition-hover active:scale-95"
+              >
+                Need Teacher Now
+              </button>
+            )}
           </div>
         )}
 
@@ -898,12 +903,22 @@ export default function App() {
               </div>
             )}
 
-            <button
-              onClick={resetSession}
-              className="mt-12 bubbly-button bg-[var(--mint-calm)] text-[var(--text-cocoa)] text-3xl font-bubble py-5 px-16 transition-all hover:opacity-80"
-            >
-              Start New Story
-            </button>
+            <div className="mt-12 flex flex-col sm:flex-row gap-4">
+              {state.response.urgency === UrgencyLevel.YELLOW && (
+                <button
+                  onClick={resumeConversation}
+                  className="bubbly-button bg-[var(--sky-blue)] text-white text-3xl font-bubble py-5 px-16 transition-all hover:opacity-90"
+                >
+                  Keep Talking to Turtle
+                </button>
+              )}
+              <button
+                onClick={resetSession}
+                className="bubbly-button bg-[var(--mint-calm)] text-[var(--text-cocoa)] text-3xl font-bubble py-5 px-16 transition-all hover:opacity-80"
+              >
+                Start New Story
+              </button>
+            </div>
           </div>
         )}
         </>
