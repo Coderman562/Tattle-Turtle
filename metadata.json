@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Tattle Turtle — Student Terminal",
+  "description": "A picture-book style emotional support app for kids (6-10) featuring a synchronized voice chat and interactive feeling cards.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

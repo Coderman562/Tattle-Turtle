@@ -1,0 +1,82 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tattle Turtle</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@400;500;600;700&family=Bubblegum+Sans&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --storybook-white: #FAFAF7;
+        --turtle-green: #9ED9C2;
+        --mint-calm: #CFF1E6;
+        --sky-blue: #B9DDF5;
+        --warm-sunshine: #FFE8A3;
+        --peachy-comfort: #FFC6B5;
+        --lavender-wonder: #D8CCF0;
+        --bubblegum-pink: #F6B1CC;
+        --soft-coral: #FF9E9E;
+        --gentle-leaf: #A8E6A3;
+        --warm-butter: #FFE3A1;
+        --blush-rose: #F7B2B2;
+        --text-clay: #6B7280;
+        --text-cocoa: #4B3F3A;
+      }
+      body {
+        font-family: 'Quicksand', sans-serif;
+        background-color: var(--storybook-white);
+        color: var(--text-clay);
+        overflow-x: hidden;
+      }
+      .font-bubble {
+        font-family: 'Bubblegum Sans', cursive;
+      }
+      .bubbly-card {
+        border-radius: 3rem;
+        transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      }
+      .bubbly-card:hover {
+        transform: translateY(-4px);
+      }
+      .bubbly-button {
+        border-radius: 9999px;
+        transition: all 0.1s;
+        box-shadow: 0 6px 0 0 rgba(0,0,0,0.05);
+      }
+      .bubbly-button:active {
+        transform: translateY(4px);
+        box-shadow: 0 2px 0 0 rgba(0,0,0,0.05);
+      }
+      .turtle-bounce {
+        animation: turtleBounce 4s infinite ease-in-out;
+      }
+      @keyframes turtleBounce {
+        0%, 100% { transform: translateY(0) rotate(-1deg); }
+        50% { transform: translateY(-10px) rotate(1deg); }
+      }
+      .listening-pulse {
+        animation: pulse 2s infinite;
+      }
+      @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(158, 217, 194, 0.5); }
+        70% { box-shadow: 0 0 0 30px rgba(158, 217, 194, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(158, 217, 194, 0); }
+      }
+    </style>
+    <script type="importmap">
+    {
+      "imports": {
+        "react/": "https://esm.sh/react@^19.2.4/",
+        "react": "https://esm.sh/react@^19.2.4",
+        "react-dom/": "https://esm.sh/react-dom@^19.2.4/",
+        "@google/genai": "https://esm.sh/@google/genai@^1.39.0"
+      }
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
