@@ -1,8 +1,10 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { TurtleResponse, UrgencyLevel, SessionState, InteractionMode } from './types';
+import { EscalationType, PatternTracker, TeacherAlert, TurtleResponse, UrgencyLevel, SessionState, InteractionMode } from './types';
 import { getTurtleSupport } from './services/geminiService';
+import { determineEscalation, detectHelpRequest, detectHighRiskContent, generateTeacherAlert } from './utils/escalationLogic';
+import { deleteTeacherAlert, getStudentPatterns, getTeacherAlerts, logInternalConcern, markEscalation, saveTeacherAlert } from './utils/patternTracking';
 
 // --- Audio Utils ---
 function encode(bytes: Uint8Array) {
@@ -54,6 +56,64 @@ function createBlob(data: Float32Array): { data: string; mimeType: string } {
   };
 }
 
+function normalizeSafetyIntentText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s']/g, ' ')
+    .replace(/\b(pls|plz|plss)\b/g, 'please')
+    .replace(/\b(halp|hep)\b/g, 'help')
+    .replace(/\b(2)\b/g, 'to')
+    .replace(/\b(u)\b/g, 'you')
+    .replace(/\b(techer|tacher|teachr|teaher|teaccher|teecher)\b/g, 'teacher')
+    .replace(/\b(dont)\b/g, "don't")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasTeacherHelpIntent(text: string): boolean {
+  const normalized = normalizeSafetyIntentText(text);
+  const patterns = [
+    /\b(i need to (talk|speak) to (a |the |my )?teacher|i want to (talk|speak) to (a |the |my )?teacher)\b/i,
+    /\b((talk|speak) to (a |the |my )?teacher)\b/i,
+    /\b(i need (a |the |my )?teacher|see (a |the |my )?teacher)\b/i,
+    /\b(tell (a |the |my )?teacher|get (a |the |my )?teacher|call (a |the |my )?teacher)\b/i,
+    /\b(i need help|please help me|can someone help me)\b/i,
+  ];
+
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
+function hasStopOrTeacherRequest(text: string): boolean {
+  const normalized = normalizeSafetyIntentText(text);
+  const patterns = [
+    /\b(i'?m done|im done|that'?s all|can i go|never mind|forget it)\b/i,
+    /\b(stop|please stop|stop talking|don'?t want to talk|no more talking|end (this )?chat)\b/i,
+    /\b(i need to (talk|speak) to (a |the |my )?teacher|i need (a |the |my )?teacher|i want to (talk|speak) to (a |the |my )?teacher)\b/i,
+    /\b((talk|speak) to (a |the |my )?teacher|see (a |the |my )?teacher)\b/i,
+    /\b(tell (a |the |my )?teacher|get (a |the |my )?teacher|call (a |the |my )?teacher)\b/i,
+    /\b(i need help|please help me|can someone help me|help me now)\b/i,
+    /\b(this is serious|i don'?t feel safe|not safe)\b/i,
+  ];
+
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
+function shouldForceTeacherEscalation(
+  latestStudentText: string,
+  conversationHistory: string,
+  patterns: PatternTracker[],
+): boolean {
+  if (
+    detectHighRiskContent(latestStudentText) ||
+    detectHelpRequest(latestStudentText) ||
+    hasTeacherHelpIntent(latestStudentText)
+  ) {
+    return true;
+  }
+
+  return determineEscalation(latestStudentText, conversationHistory, patterns) === EscalationType.IMMEDIATE;
+}
+
 export default function App() {
   const [state, setState] = useState<SessionState>({
     step: 'WELCOME',
@@ -66,14 +126,27 @@ export default function App() {
   const [activeResultCard, setActiveResultCard] = useState<'MISSION' | 'METER' | null>(null);
   const [volume, setVolume] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [needsEscalationConfirmation, setNeedsEscalationConfirmation] = useState(false);
+  const [teacherContactStatus, setTeacherContactStatus] = useState<string | null>(null);
+  const [showTeacherDashboard, setShowTeacherDashboard] = useState(false);
+  const [teacherAlerts, setTeacherAlerts] = useState<TeacherAlert[]>([]);
+  const [teacherDashboardToast, setTeacherDashboardToast] = useState<string | null>(null);
 
   // Audio Context Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const conversationHistoryRef = useRef<string>('');
   const sessionPromiseRef = useRef<any>(null);
+  const studentIdRef = useRef<string>('anonymous-student');
+  const isEndingSessionRef = useRef(false);
+  const forceTeacherEscalationRef = useRef(false);
+  const recentStudentTextRef = useRef('');
+  const alertSentThisSessionRef = useRef(false);
+  const lastSeenTeacherAlertRef = useRef<string | null>(null);
   
   // Silence Detection
   const silenceTimerRef = useRef<any>(null);
@@ -111,8 +184,94 @@ export default function App() {
     };
   }, [state.step, isSpeaking]);
 
+  useEffect(() => {
+    const key = 'tattle_turtle_student_id_v1';
+    const existing = localStorage.getItem(key);
+    if (existing) {
+      studentIdRef.current = existing;
+      return;
+    }
+
+    const generated = `student-${Math.random().toString(36).slice(2, 10)}`;
+    studentIdRef.current = generated;
+    localStorage.setItem(key, generated);
+  }, []);
+
+  useEffect(() => {
+    setTeacherAlerts(getTeacherAlerts());
+  }, []);
+
+  useEffect(() => {
+    if (!showTeacherDashboard) {
+      return;
+    }
+
+    const refresh = () => setTeacherAlerts(getTeacherAlerts());
+    refresh();
+    const interval = window.setInterval(refresh, 1500);
+    return () => window.clearInterval(interval);
+  }, [showTeacherDashboard]);
+
+  useEffect(() => {
+    if (teacherAlerts.length === 0) {
+      return;
+    }
+
+    const newestAlert = teacherAlerts[0];
+    if (lastSeenTeacherAlertRef.current && lastSeenTeacherAlertRef.current !== newestAlert.timestamp) {
+      lastSeenTeacherAlertRef.current = newestAlert.timestamp;
+      setTeacherDashboardToast('New teacher alert created');
+      const timeout = window.setTimeout(() => setTeacherDashboardToast(null), 3500);
+      return () => window.clearTimeout(timeout);
+    }
+
+    lastSeenTeacherAlertRef.current = newestAlert.timestamp;
+  }, [teacherAlerts]);
+
+  const stopRealtimeResources = () => {
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    activeSourcesRef.current.forEach(s => s.stop());
+    activeSourcesRef.current.clear();
+    setIsSpeaking(false);
+
+    scriptProcessorRef.current?.disconnect();
+    scriptProcessorRef.current = null;
+
+    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
+    mediaStreamRef.current = null;
+  };
+
+  const triggerImmediateTeacherAlert = (summary: string) => {
+    if (alertSentThisSessionRef.current) {
+      return;
+    }
+
+    const alert: TeacherAlert = {
+      timestamp: new Date().toISOString(),
+      escalationType: EscalationType.IMMEDIATE,
+      urgency: UrgencyLevel.RED,
+      summary: summary.split(/\s+/).slice(0, 20).join(' '),
+      concernCategory: 'emotional_regulation',
+      primaryEmotion: 'unspecified',
+      patternFlag: false,
+      studentConfirmedEscalation: true,
+      actionSuggestion: 'Check in with student privately',
+    };
+
+    saveTeacherAlert(alert);
+    markEscalation(studentIdRef.current, EscalationType.IMMEDIATE);
+    setTeacherAlerts(getTeacherAlerts());
+    setTeacherContactStatus('Teacher has been notified to check in privately.');
+    window.alert('New teacher alert created. Please check in with the student now.');
+    alertSentThisSessionRef.current = true;
+  };
+
   const startVoiceSession = async (customGreeting?: string) => {
     setError(null);
+    isEndingSessionRef.current = false;
+    forceTeacherEscalationRef.current = false;
+    alertSentThisSessionRef.current = false;
+    setTeacherContactStatus(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
@@ -121,6 +280,7 @@ export default function App() {
           autoGainControl: true,
         } 
       });
+      mediaStreamRef.current = stream;
       
       setState(prev => ({ ...prev, step: 'VOICE_CHAT' }));
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -161,8 +321,13 @@ export default function App() {
 
             const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
+            scriptProcessorRef.current = scriptProcessor;
             
             scriptProcessor.onaudioprocess = (e) => {
+              if (isEndingSessionRef.current) {
+                return;
+              }
+
               const inputData = e.inputBuffer.getChannelData(0);
               let sum = 0;
               let peak = 0;
@@ -188,9 +353,33 @@ export default function App() {
             resetSilenceTimer();
           },
           onmessage: async (message: LiveServerMessage) => {
+            if (isEndingSessionRef.current) {
+              return;
+            }
+
             if (message.serverContent?.inputTranscription) {
-              conversationHistoryRef.current += ' Student: ' + message.serverContent.inputTranscription.text;
+              const childText = message.serverContent.inputTranscription.text;
+              conversationHistoryRef.current += ' Student: ' + childText;
+              recentStudentTextRef.current = `${recentStudentTextRef.current} ${childText}`.slice(-600);
               resetSilenceTimer();
+
+              const patterns = getStudentPatterns(studentIdRef.current);
+              const stopCandidate = `${childText} ${recentStudentTextRef.current}`;
+              if (shouldForceTeacherEscalation(stopCandidate, conversationHistoryRef.current, patterns)) {
+                forceTeacherEscalationRef.current = true;
+                triggerImmediateTeacherAlert('Student asked for teacher support during voice chat.');
+                endVoiceSession();
+                return;
+              }
+
+              if (hasStopOrTeacherRequest(stopCandidate)) {
+                if (hasTeacherHelpIntent(stopCandidate)) {
+                  forceTeacherEscalationRef.current = true;
+                  triggerImmediateTeacherAlert('Student requested teacher support.');
+                }
+                endVoiceSession();
+                return;
+              }
             }
             
             if (message.serverContent?.outputTranscription) {
@@ -243,31 +432,64 @@ export default function App() {
   };
 
   const endVoiceSession = async () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    activeSourcesRef.current.forEach(s => s.stop());
-    sessionPromiseRef.current?.then((session: any) => session.close());
+    if (isEndingSessionRef.current) {
+      return;
+    }
+    isEndingSessionRef.current = true;
+    stopRealtimeResources();
+    setState(prev => ({ ...prev, step: 'PROCESSING' }));
+    await sessionPromiseRef.current?.then((session: any) => session.close()).catch(() => {});
+    sessionPromiseRef.current = null;
     handleFinalSubmit(conversationHistoryRef.current || "(Silence)");
   };
 
   const handleFinalSubmit = async (text: string) => {
     setState(prev => ({ ...prev, step: 'PROCESSING' }));
+    setTeacherContactStatus(null);
     try {
-      const response = await getTurtleSupport(text);
+      const patterns = getStudentPatterns(studentIdRef.current);
+      const response = await getTurtleSupport(text, conversationHistoryRef.current || text, patterns, studentIdRef.current);
+      const transcriptRequestsTeacher = hasTeacherHelpIntent(text) || hasTeacherHelpIntent(conversationHistoryRef.current || '');
+      const shouldAutoNotifyTeacher =
+        forceTeacherEscalationRef.current ||
+        response.escalationType === EscalationType.IMMEDIATE ||
+        transcriptRequestsTeacher;
+
+      if (shouldAutoNotifyTeacher) {
+        if (!alertSentThisSessionRef.current) {
+          const alert = generateTeacherAlert(response, true);
+          saveTeacherAlert(alert);
+          markEscalation(studentIdRef.current, response.escalationType || EscalationType.IMMEDIATE);
+          setTeacherAlerts(getTeacherAlerts());
+          window.alert('New teacher alert created. Please check in with the student now.');
+          alertSentThisSessionRef.current = true;
+        }
+        response.needsEscalationConfirmation = false;
+        setTeacherContactStatus('Teacher has been notified to check in privately.');
+      }
+
+      setNeedsEscalationConfirmation(Boolean(response.needsEscalationConfirmation) && !shouldAutoNotifyTeacher);
       setState(prev => ({ ...prev, step: 'RESULTS', response }));
     } catch (err: any) {
-      setError("Turtle needs a little break. Try again in a minute!");
+      setError("Please talk to your teacher! Turtle cannot no longer assist you.");
       setState(prev => ({ ...prev, step: 'WELCOME' }));
     }
   };
 
   const resetSession = () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    activeSourcesRef.current.forEach(s => s.stop());
+    isEndingSessionRef.current = false;
+    forceTeacherEscalationRef.current = false;
+    alertSentThisSessionRef.current = false;
+    recentStudentTextRef.current = '';
+    stopRealtimeResources();
+    sessionPromiseRef.current?.then((session: any) => session.close()).catch(() => {});
+    sessionPromiseRef.current = null;
     setState({ step: 'WELCOME', inputMode: 'VOICE', interactionMode: 'LISTENING', transcript: '', response: null });
     setError(null);
     setActiveResultCard(null);
+    setNeedsEscalationConfirmation(false);
+    setTeacherContactStatus(null);
     conversationHistoryRef.current = '';
-    setIsSpeaking(false);
   };
 
   const resumeConversation = () => {
@@ -276,17 +498,111 @@ export default function App() {
     startVoiceSession(followUp);
   };
 
+  const confirmEscalation = (confirmed: boolean) => {
+    if (!state.response) {
+      setNeedsEscalationConfirmation(false);
+      return;
+    }
+
+    if (confirmed) {
+      const alert = generateTeacherAlert(state.response, true);
+      saveTeacherAlert(alert);
+      markEscalation(studentIdRef.current, state.response.escalationType || EscalationType.IMMEDIATE);
+      setTeacherAlerts(getTeacherAlerts());
+      window.alert('New teacher alert created. Please check in with the student now.');
+      setTeacherContactStatus('Teacher has been notified to check in privately.');
+    } else {
+      logInternalConcern(
+        studentIdRef.current,
+        state.response.summary || 'Escalation declined by student.',
+        state.response.escalationType || EscalationType.IMMEDIATE,
+      );
+      setTeacherContactStatus('Okay. We will not notify a teacher right now.');
+    }
+
+    setNeedsEscalationConfirmation(false);
+  };
+
   return (
     <div className="min-h-screen px-4 py-10 md:px-12 md:py-16 flex flex-col items-center">
+      {showTeacherDashboard && teacherDashboardToast && (
+        <div className="fixed top-6 right-6 z-50 bg-[var(--soft-coral)] text-white px-6 py-4 rounded-[1.25rem] shadow-2xl border-2 border-white">
+          <p className="text-xl font-bubble">{teacherDashboardToast}</p>
+        </div>
+      )}
       <header className="flex flex-col items-center mb-12 text-center">
         <div className="flex items-center gap-6 mb-2 cursor-pointer" onClick={resetSession}>
           <div className="text-8xl turtle-bounce">🐢</div>
           <h1 className="text-6xl font-bubble text-[var(--text-cocoa)] tracking-wide drop-shadow-sm">Tattle Turtle</h1>
         </div>
+        <div className="flex gap-3 mb-4">
+          <button
+            onClick={() => setShowTeacherDashboard(false)}
+            className={`bubbly-button px-6 py-3 text-xl font-bubble ${!showTeacherDashboard ? 'bg-[var(--sky-blue)] text-white' : 'bg-white text-[var(--text-cocoa)]'}`}
+          >
+            Student View
+          </button>
+          <button
+            onClick={() => setShowTeacherDashboard(true)}
+            className={`bubbly-button px-6 py-3 text-xl font-bubble ${showTeacherDashboard ? 'bg-[var(--soft-coral)] text-white' : 'bg-white text-[var(--text-cocoa)]'}`}
+          >
+            Teacher Dashboard
+          </button>
+        </div>
         <p className="text-2xl text-[var(--text-clay)] font-bubble italic">Slow and steady, we share our worries.</p>
       </header>
 
       <main className="w-full max-w-4xl flex flex-col items-center">
+        {showTeacherDashboard && (
+          <div className="w-full max-w-4xl bubbly-card bg-white p-8 md:p-10">
+            <h2 className="text-4xl font-bubble text-[var(--text-cocoa)] mb-6">Teacher Alerts</h2>
+            {teacherAlerts.length === 0 ? (
+              <p className="text-2xl text-[var(--text-clay)]">No alerts yet.</p>
+            ) : (
+              <div className="flex flex-col gap-4">
+                {teacherAlerts.map((alert, index) => (
+                  <div key={`${alert.timestamp}-${index}`} className="rounded-[1.5rem] p-5 border-2 border-[var(--mint-calm)]">
+                    <div className="flex justify-between items-start gap-4">
+                      <div className="flex flex-wrap gap-3 text-lg text-[var(--text-cocoa)] mb-2">
+                        <span className="font-bold">{new Date(alert.timestamp).toLocaleString()}</span>
+                        <span className={`px-3 py-1 rounded-full text-white ${
+                          alert.urgency === UrgencyLevel.RED
+                            ? 'bg-[var(--blush-rose)]'
+                            : alert.urgency === UrgencyLevel.YELLOW
+                              ? 'bg-[var(--warm-butter)]'
+                              : 'bg-[var(--gentle-leaf)]'
+                        }`}>
+                          {alert.urgency}
+                        </span>
+                        <span className="px-3 py-1 rounded-full bg-[var(--mint-calm)]">{alert.concernCategory}</span>
+                      </div>
+                      <button
+                        onClick={() => {
+                          deleteTeacherAlert(alert.timestamp);
+                          setTeacherAlerts(getTeacherAlerts());
+                        }}
+                        className="bubbly-button bg-[var(--gentle-leaf)] text-white text-xl px-4 py-2"
+                        title="Mark handled and remove alert"
+                      >
+                        ✓
+                      </button>
+                    </div>
+                    <p className="text-xl text-[var(--text-cocoa)] mb-2">{alert.summary}</p>
+                    <p className="text-base text-[var(--text-clay)]">
+                      Consent: {alert.studentConfirmedEscalation ? 'Yes' : 'No'} | Pattern: {alert.patternFlag ? 'Yes' : 'No'}
+                    </p>
+                    {alert.actionSuggestion && (
+                      <p className="text-base text-[var(--text-clay)]">Action: {alert.actionSuggestion}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!showTeacherDashboard && (
+        <>
         {state.step === 'WELCOME' && !state.response && (
           <div className="flex flex-col items-center gap-12 w-full animate-in fade-in zoom-in duration-500">
             <div className="bg-[var(--mint-calm)] p-3 rounded-[3.5rem] shadow-sm flex gap-3 w-full max-w-xl">
@@ -351,6 +667,16 @@ export default function App() {
             >
               I'm All Done!
             </button>
+            <button
+              onClick={() => {
+                forceTeacherEscalationRef.current = true;
+                triggerImmediateTeacherAlert('Student pressed Need Teacher Now.');
+                endVoiceSession();
+              }}
+              className="bubbly-button bg-[var(--soft-coral)] hover:opacity-90 text-white text-4xl font-bubble py-7 px-16 shadow-lg transform transition-hover active:scale-95"
+            >
+              Need Teacher Now
+            </button>
           </div>
         )}
 
@@ -367,7 +693,7 @@ export default function App() {
               <p className="text-4xl font-bubble text-[var(--peachy-comfort)] italic mb-3">
                 {state.response.sufficient 
                   ? (state.interactionMode === 'LISTENING' ? "I heard every bit! ❤️" : "We did some great thinking! 🧠")
-                  : "Turtle wants to hear just a little bit more! 👂"
+                  : ""
                 }
               </p>
               {state.response.sufficient && (
@@ -375,7 +701,13 @@ export default function App() {
               )}
             </div>
 
-            {state.response.sufficient ? (
+            {state.response.shouldEndConversation ? (
+              <div className="bg-[var(--gentle-leaf)] bubbly-card p-10 text-center w-full max-w-2xl">
+                <p className="text-4xl font-bubble text-white">
+                  {state.response.closingMessage || "I'm glad we talked. Take care!"}
+                </p>
+              </div>
+            ) : state.response.sufficient ? (
               <>
                 <div className="flex flex-col sm:flex-row gap-8 w-full max-w-3xl">
                   <button
@@ -423,16 +755,38 @@ export default function App() {
                 <p className="text-3xl font-bubble text-[var(--text-clay)] max-w-md text-center italic">
                    "{state.response.listeningHealing}"
                 </p>
-                <button
-                  onClick={resumeConversation}
-                  className="bubbly-button bg-[var(--sky-blue)] text-white text-5xl font-bubble py-8 px-20 shadow-xl transition-all hover:scale-105 active:scale-95"
-                >
-                  Let’s keep talking 💬
-                </button>
               </div>
             )}
 
-            {state.response.urgency === UrgencyLevel.RED && (
+            {needsEscalationConfirmation && state.response.escalationType === EscalationType.IMMEDIATE && (
+              <div className="bg-[var(--warm-sunshine)] bubbly-card p-12 mt-4 w-full max-w-2xl animate-in zoom-in duration-500">
+                <p className="text-3xl font-bubble text-[var(--text-cocoa)] mb-6 text-center">
+                  This sounds really important. I think your teacher should know so they can help. Is that okay with you?
+                </p>
+                <div className="flex gap-6">
+                  <button
+                    onClick={() => confirmEscalation(true)}
+                    className="flex-1 bubbly-button bg-[var(--gentle-leaf)] text-white text-3xl py-6"
+                  >
+                    Yes, tell my teacher
+                  </button>
+                  <button
+                    onClick={() => confirmEscalation(false)}
+                    className="flex-1 bubbly-button bg-[var(--text-clay)] text-white text-3xl py-6"
+                  >
+                    Not right now
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {teacherContactStatus && (
+              <div className="bg-white bubbly-card p-6 w-full max-w-2xl border-4 border-[var(--gentle-leaf)]">
+                <p className="text-2xl font-bubble text-[var(--text-cocoa)] text-center">{teacherContactStatus}</p>
+              </div>
+            )}
+
+            {state.response.urgency === UrgencyLevel.RED && !needsEscalationConfirmation && (
               <div className="bg-[var(--blush-rose)] bubbly-card p-12 mt-12 w-full max-w-2xl animate-in zoom-in duration-500">
                 <h3 className="text-5xl font-bubble text-white mb-6 text-center">Wait! 🆘</h3>
                 <p className="text-2xl text-white mb-8 font-medium text-center leading-relaxed">
@@ -442,8 +796,36 @@ export default function App() {
                   "{state.response.helpInstruction}"
                 </div>
                 <div className="flex gap-6">
-                  <button onClick={resetSession} className="flex-1 bubbly-button bg-white text-[var(--soft-coral)] text-3xl font-bubble py-6 shadow-md hover:bg-white/100">I will talk to a teacher</button>
-                  <button onClick={resetSession} className="flex-1 bubbly-button bg-[var(--soft-coral)] border-4 border-white text-white text-3xl font-bubble py-6">Not now</button>
+                  <button
+                    onClick={() => {
+                      if (state.response) {
+                        const alert = generateTeacherAlert(state.response, true);
+                        saveTeacherAlert(alert);
+                        markEscalation(studentIdRef.current, state.response.escalationType || EscalationType.IMMEDIATE);
+                        setTeacherAlerts(getTeacherAlerts());
+                        window.alert('New teacher alert created. Please check in with the student now.');
+                        setTeacherContactStatus('Teacher has been notified to check in privately.');
+                      }
+                    }}
+                    className="flex-1 bubbly-button bg-white text-[var(--soft-coral)] text-3xl font-bubble py-6 shadow-md hover:bg-white/100"
+                  >
+                    I will talk to a teacher
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (state.response) {
+                        logInternalConcern(
+                          studentIdRef.current,
+                          state.response.summary || 'Student deferred teacher outreach.',
+                          state.response.escalationType || EscalationType.IMMEDIATE,
+                        );
+                        setTeacherContactStatus('Okay. We will not notify a teacher right now.');
+                      }
+                    }}
+                    className="flex-1 bubbly-button bg-[var(--soft-coral)] border-4 border-white text-white text-3xl font-bubble py-6"
+                  >
+                    Not now
+                  </button>
                 </div>
               </div>
             )}
@@ -455,6 +837,8 @@ export default function App() {
               Start New Story
             </button>
           </div>
+        )}
+        </>
         )}
       </main>
 
