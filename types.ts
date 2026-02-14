@@ -45,6 +45,17 @@ export interface TurtleResponse {
   summary: string;
   urgency: UrgencyLevel;
   helpInstruction?: string;
+  tammyResponse?: string;
+  severity?: UrgencyLevel;
+  tags?: string[];
+  emotionSource?: {
+    verbal: string;
+    facial: string;
+    confidence: number;
+    mismatch: boolean;
+  };
+  teacherNote?: string;
+  nextAction?: 'LISTEN' | 'FOLLOW_UP' | 'ESCALATE';
 }
 
 export type InteractionMode = 'LISTENING' | 'SOCRATIC';

@@ -83,6 +83,20 @@ function hasTeacherHelpIntent(text: string): boolean {
   return patterns.some((pattern) => pattern.test(normalized));
 }
 
+function hasLonelinessSignal(text: string): boolean {
+  const normalized = normalizeSafetyIntentText(text)
+    .replace(/\b(lonley|lonly|loney)\b/g, 'lonely')
+    .replace(/\b(by myself)\b/g, 'alone');
+
+  const patterns = [
+    /\b(lonely|alone|left out|excluded)\b/i,
+    /\b(no one to play|nobody plays with me|no friends|without friends)\b/i,
+    /\b(i have no one|nobody likes me)\b/i,
+  ];
+
+  return patterns.some((pattern) => pattern.test(normalized));
+}
+
 function hasStopOrTeacherRequest(text: string): boolean {
   const normalized = normalizeSafetyIntentText(text);
   const patterns = [
@@ -131,6 +145,7 @@ export default function App() {
   const [showTeacherDashboard, setShowTeacherDashboard] = useState(false);
   const [teacherAlerts, setTeacherAlerts] = useState<TeacherAlert[]>([]);
   const [teacherDashboardToast, setTeacherDashboardToast] = useState<string | null>(null);
+  const [studentNotice, setStudentNotice] = useState<string | null>(null);
 
   // Audio Context Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -146,6 +161,7 @@ export default function App() {
   const forceTeacherEscalationRef = useRef(false);
   const recentStudentTextRef = useRef('');
   const alertSentThisSessionRef = useRef(false);
+  const yellowAlertSentThisSessionRef = useRef(false);
   const lastSeenTeacherAlertRef = useRef<string | null>(null);
   
   // Silence Detection
@@ -271,7 +287,9 @@ export default function App() {
     isEndingSessionRef.current = false;
     forceTeacherEscalationRef.current = false;
     alertSentThisSessionRef.current = false;
+    yellowAlertSentThisSessionRef.current = false;
     setTeacherContactStatus(null);
+    setStudentNotice(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
@@ -365,6 +383,30 @@ export default function App() {
 
               const patterns = getStudentPatterns(studentIdRef.current);
               const stopCandidate = `${childText} ${recentStudentTextRef.current}`;
+              const liveEscalation = determineEscalation(stopCandidate, conversationHistoryRef.current, patterns);
+              const shouldLogYellowNow = liveEscalation === EscalationType.PATTERN || hasLonelinessSignal(childText);
+
+              if (!yellowAlertSentThisSessionRef.current && shouldLogYellowNow) {
+                const alert: TeacherAlert = {
+                  timestamp: new Date().toISOString(),
+                  escalationType: EscalationType.PATTERN,
+                  urgency: UrgencyLevel.YELLOW,
+                  summary: hasLonelinessSignal(childText)
+                    ? 'Student shared loneliness and may need a gentle teacher check-in.'
+                    : 'Student shared medium-level distress and may need a gentle teacher check-in.',
+                  concernCategory: hasLonelinessSignal(childText) ? 'social_exclusion' : 'emotional_regulation',
+                  primaryEmotion: hasLonelinessSignal(childText) ? 'lonely' : 'unspecified',
+                  patternFlag: true,
+                  studentConfirmedEscalation: false,
+                  actionSuggestion: 'Check in with student privately today',
+                };
+                saveTeacherAlert(alert);
+                markEscalation(studentIdRef.current, EscalationType.PATTERN);
+                setTeacherAlerts(getTeacherAlerts());
+                setStudentNotice('Teacher notified for a gentle check-in. You can keep talking to Turtle.');
+                yellowAlertSentThisSessionRef.current = true;
+              }
+
               if (shouldForceTeacherEscalation(stopCandidate, conversationHistoryRef.current, patterns)) {
                 forceTeacherEscalationRef.current = true;
                 triggerImmediateTeacherAlert('Student asked for teacher support during voice chat.');
@@ -454,6 +496,23 @@ export default function App() {
         forceTeacherEscalationRef.current ||
         response.escalationType === EscalationType.IMMEDIATE ||
         transcriptRequestsTeacher;
+      const lonelinessMentioned =
+        hasLonelinessSignal(text) ||
+        hasLonelinessSignal(conversationHistoryRef.current || '') ||
+        hasLonelinessSignal(recentStudentTextRef.current || '') ||
+        Boolean(response.tags?.includes('loneliness'));
+      const shouldCreateTeacherDashboardAlert =
+        shouldAutoNotifyTeacher || response.urgency === UrgencyLevel.YELLOW || lonelinessMentioned;
+
+      if (shouldCreateTeacherDashboardAlert && !shouldAutoNotifyTeacher && !yellowAlertSentThisSessionRef.current) {
+        const alert = generateTeacherAlert(response, shouldAutoNotifyTeacher);
+        saveTeacherAlert(alert);
+        if ((response.escalationType || EscalationType.NONE) !== EscalationType.NONE) {
+          markEscalation(studentIdRef.current, response.escalationType || EscalationType.PATTERN);
+        }
+        setTeacherAlerts(getTeacherAlerts());
+        yellowAlertSentThisSessionRef.current = true;
+      }
 
       if (shouldAutoNotifyTeacher) {
         if (!alertSentThisSessionRef.current) {
@@ -461,11 +520,13 @@ export default function App() {
           saveTeacherAlert(alert);
           markEscalation(studentIdRef.current, response.escalationType || EscalationType.IMMEDIATE);
           setTeacherAlerts(getTeacherAlerts());
-          window.alert('New teacher alert created. Please check in with the student now.');
           alertSentThisSessionRef.current = true;
         }
+        window.alert('New teacher alert created. Please check in with the student now.');
         response.needsEscalationConfirmation = false;
         setTeacherContactStatus('Teacher has been notified to check in privately.');
+      } else if (shouldCreateTeacherDashboardAlert) {
+        setTeacherContactStatus('Teacher dashboard updated for a gentle check-in.');
       }
 
       setNeedsEscalationConfirmation(Boolean(response.needsEscalationConfirmation) && !shouldAutoNotifyTeacher);
@@ -480,6 +541,7 @@ export default function App() {
     isEndingSessionRef.current = false;
     forceTeacherEscalationRef.current = false;
     alertSentThisSessionRef.current = false;
+    yellowAlertSentThisSessionRef.current = false;
     recentStudentTextRef.current = '';
     stopRealtimeResources();
     sessionPromiseRef.current?.then((session: any) => session.close()).catch(() => {});
@@ -489,6 +551,7 @@ export default function App() {
     setActiveResultCard(null);
     setNeedsEscalationConfirmation(false);
     setTeacherContactStatus(null);
+    setStudentNotice(null);
     conversationHistoryRef.current = '';
   };
 
@@ -633,6 +696,11 @@ export default function App() {
 
         {state.step === 'VOICE_CHAT' && (
           <div className="flex flex-col items-center gap-10 animate-in slide-in-from-bottom-8 duration-500">
+            {studentNotice && (
+              <div className="bubbly-card bg-[var(--warm-butter)] px-6 py-4 text-center max-w-2xl">
+                <p className="text-xl font-bubble text-[var(--text-cocoa)]">{studentNotice}</p>
+              </div>
+            )}
             <div className="relative group">
               <div 
                 className={`absolute inset-0 rounded-full blur-3xl opacity-40 transition-all duration-300 ${isSpeaking ? 'bg-[var(--warm-sunshine)] scale-125' : 'bg-[var(--turtle-green)] scale-100'}`}

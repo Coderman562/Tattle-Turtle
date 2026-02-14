@@ -64,12 +64,12 @@ export function detectImmediateDangerOverride(transcript: string): boolean {
 }
 
 export function getCurrentConcernType(transcript: string): ConcernType {
-  if (/\b(bully|mean|fight|pushed|hit|tease|exclude|left out|recess|friend)\b/i.test(transcript)) {
-    return 'peer_conflict';
+  if (/\b(lonely|alone|left\s+out|excluded|nobody\s+plays|no\s+one\s+picked\s+me|alone\s+at\s+lunch)\b/i.test(transcript)) {
+    return 'social_exclusion';
   }
 
-  if (/\b(nobody\s+plays|no\s+one\s+picked\s+me|alone\s+at\s+lunch|left\s+out)\b/i.test(transcript)) {
-    return 'social_exclusion';
+  if (/\b(bully|mean|fight|pushed|hit|tease|exclude|left out|recess|friend)\b/i.test(transcript)) {
+    return 'peer_conflict';
   }
 
   if (/\b(test|grade|homework|schoolwork|class|teacher\s+said\s+my\s+work)\b/i.test(transcript)) {
@@ -87,6 +87,19 @@ export function getCurrentConcernType(transcript: string): ConcernType {
   return 'emotional_regulation';
 }
 
+function detectModerateConcern(transcript: string): boolean {
+  const mediumRiskPatterns = [
+    /\b(lonely|alone|left out|excluded|no friends|nobody likes me)\b/i,
+    /\b(sad|down|upset|crying|feeling bad)\b/i,
+    /\b(scared|afraid|worried|anxious|nervous)\b/i,
+    /\b(angry|mad|furious)\b/i,
+    /\b(friend problem|friend was mean|argument|fight with friend)\b/i,
+    /\b(stressed|too much homework|school is hard|test stress)\b/i,
+  ];
+
+  return mediumRiskPatterns.some((pattern) => pattern.test(transcript));
+}
+
 export function determineEscalation(
   transcript: string,
   conversationHistory: string,
@@ -98,6 +111,14 @@ export function determineEscalation(
 
   if (detectHelpRequest(transcript)) {
     return EscalationType.IMMEDIATE;
+  }
+
+  if (/\b(lonely|alone|left out|no one to play|nobody plays with me|no friends)\b/i.test(transcript)) {
+    return EscalationType.PATTERN;
+  }
+
+  if (detectModerateConcern(transcript) || detectModerateConcern(conversationHistory)) {
+    return EscalationType.PATTERN;
   }
 
   const concernType = getCurrentConcernType(transcript);
