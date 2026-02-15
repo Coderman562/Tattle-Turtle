@@ -1,15 +1,16 @@
-
 export enum UrgencyLevel {
   GREEN = 'GREEN',
   YELLOW = 'YELLOW',
-  RED = 'RED'
+  RED = 'RED',
 }
 
 export enum EscalationType {
   NONE = 'NONE',
   PATTERN = 'PATTERN',
-  IMMEDIATE = 'IMMEDIATE'
+  IMMEDIATE = 'IMMEDIATE',
 }
+
+export type SafetyOutcome = 'GREEN' | 'TEACHER_REQUIRED';
 
 export type ConcernType =
   | 'peer_conflict'
@@ -31,30 +32,35 @@ export interface ExerciseData {
   reward: string;
 }
 
-export interface TurtleResponse {
+export interface ConversationSummary {
   sufficient: boolean;
   shouldEndConversation?: boolean;
   closingMessage?: string;
-  needsEscalationConfirmation?: boolean;
-  escalationType?: EscalationType;
-  concernType?: ConcernType;
   followUpQuestion?: string;
   listeningHealing: string;
   reflectionHelper: string;
   exercise: ExerciseData;
   summary: string;
+  tammyResponse?: string;
+  tags?: string[];
+  teacherNote?: string;
+  nextAction?: 'LISTEN' | 'FOLLOW_UP' | 'ESCALATE';
+}
+
+// Legacy response shape preserved for compatibility while conversation flow migrates.
+export interface TurtleResponse extends ConversationSummary {
+  needsEscalationConfirmation?: boolean;
+  escalationType?: EscalationType;
+  concernType?: ConcernType;
   urgency: UrgencyLevel;
   helpInstruction?: string;
-  tammyResponse?: string;
   severity?: UrgencyLevel;
-  tags?: string[];
   emotionSource?: {
     verbal: string;
     facial: string;
     confidence: number;
     mismatch: boolean;
   };
-  teacherNote?: string;
   nextAction?: 'LISTEN' | 'FOLLOW_UP' | 'ESCALATE';
 }
 
@@ -62,22 +68,17 @@ export type InteractionMode = 'LISTENING' | 'SOCRATIC';
 
 export interface TeacherAlert {
   timestamp: string;
-  escalationType: EscalationType;
-  urgency: UrgencyLevel;
+  safetyOutcome: SafetyOutcome;
   summary: string;
-  concernCategory: ConcernType;
-  primaryEmotion: string;
-  patternFlag: boolean;
-  studentConfirmedEscalation: boolean;
+  reasonCode: string;
+  teacherNotice?: string;
   actionSuggestion?: string;
 }
 
 export interface SessionState {
-  step: 'WELCOME' | 'INPUT' | 'VOICE_CHAT' | 'PROCESSING' | 'RESULTS';
-  inputMode: 'TEXT' | 'VOICE';
+  step: 'WELCOME' | 'VOICE_CHAT' | 'PROCESSING' | 'RESULTS';
   interactionMode: InteractionMode;
-  transcript: string;
-  response: TurtleResponse | null;
+  response: ConversationSummary | null;
 }
 
 export interface TurtleConversation {
@@ -138,4 +139,52 @@ export interface ParentSummary {
   growthMoment: GrowthMoment;
   weekCovered: string;
   generatedAt: string;
+}
+
+export type ConversationEventType =
+  | 'SESSION_START'
+  | 'STUDENT_UTTERANCE'
+  | 'MODEL_UTTERANCE'
+  | 'SESSION_END'
+  | 'MANUAL_TEACHER_REQUEST';
+
+export type ConversationRole = 'SYSTEM' | 'STUDENT' | 'MODEL';
+
+export interface ConversationEvent {
+  type: ConversationEventType;
+  role: ConversationRole;
+  studentId: string;
+  conversationId: string;
+  utteranceId: number;
+  timestamp: string;
+  text?: string;
+  metadata?: Record<string, string | number | boolean>;
+}
+
+export interface SafetyDecision {
+  studentId: string;
+  conversationId: string;
+  utteranceId: number;
+  safetyOutcome: SafetyOutcome;
+  teacherNotifyNow: boolean;
+  shouldEndConversation: boolean;
+  reasonCode: string;
+  confidence: number;
+  latencyMs?: number;
+  studentNotice?: string;
+  teacherNotice?: string;
+}
+
+export interface EvaluatorPolicyConfig {
+  rollingWindowLimit: number;
+  responseTimeoutMs: number;
+  model: string;
+  failSafeOutcome: SafetyOutcome;
+}
+
+export type EvaluatorWorkerMessageKind = 'EVALUATE' | 'DECISION' | 'WORKER_ERROR' | 'HEARTBEAT';
+
+export interface EvaluatorWorkerMessage<T = unknown> {
+  kind: EvaluatorWorkerMessageKind;
+  payload: T;
 }
