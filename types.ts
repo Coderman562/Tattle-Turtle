@@ -79,3 +79,63 @@ export interface SessionState {
   transcript: string;
   response: TurtleResponse | null;
 }
+
+export interface TurtleConversation {
+  timestamp: string;
+  studentText: string;
+  turtleSummary: string;
+  urgency: UrgencyLevel;
+  concernType: ConcernType;
+  escalationType: EscalationType;
+  tags?: string[];
+}
+
+export interface StudentInfo {
+  id: string;
+  firstName?: string;
+  parentEmail?: string;
+  optedOutOfParentCommunication?: boolean;
+  doNotContactParents?: boolean;
+}
+
+export interface ReadingMaterial {
+  title: string;
+  intro: string;
+  quickRead: string;
+  tips: string[];
+  parentScript: string;
+}
+
+export interface Activity {
+  title: string;
+  durationMinutes: number;
+  materials: string[];
+  steps: string[];
+  connectionQuestion: string;
+}
+
+export interface BookRecommendation {
+  title: string;
+  author: string;
+  theme: string;
+  ratingOutOf5: number;
+  whyItFits: string;
+}
+
+export interface GrowthMoment {
+  headline: string;
+  celebration: string;
+  skillsPracticed: string[];
+  brightSpots: string[];
+  encouragement: string;
+}
+
+export interface ParentSummary {
+  readingMaterial: ReadingMaterial;
+  activity: Activity;
+  activities: Activity[];
+  bookRecommendations: BookRecommendation[];
+  growthMoment: GrowthMoment;
+  weekCovered: string;
+  generatedAt: string;
+}

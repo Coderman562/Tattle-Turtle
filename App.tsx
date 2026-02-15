@@ -1,8 +1,22 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { EscalationType, PatternTracker, TeacherAlert, TurtleResponse, UrgencyLevel, SessionState, InteractionMode } from './types';
+import {
+  EscalationType,
+  InteractionMode,
+  SessionState,
+  StudentInfo,
+  TeacherAlert,
+  ParentSummary,
+  TurtleResponse,
+  UrgencyLevel,
+  PatternTracker,
+} from './types';
 import { getTurtleSupport } from './services/geminiService';
+import {
+  generateAndSendParentSummary,
+  recordConversationForParentSummary,
+} from './services/parentSummaryGenerator';
 import { determineEscalation, detectHelpRequest, detectHighRiskContent, generateTeacherAlert } from './utils/escalationLogic';
 import { deleteTeacherAlert, getStudentPatterns, getTeacherAlerts, logInternalConcern, markEscalation, saveTeacherAlert } from './utils/patternTracking';
 
@@ -83,6 +97,46 @@ function hasTeacherHelpIntent(text: string): boolean {
   return patterns.some((pattern) => pattern.test(normalized));
 }
 
+function hasImmediateTeacherKeyword(text: string): boolean {
+  const normalized = normalizeSafetyIntentText(text);
+  return /\bteacher\b/i.test(normalized);
+}
+
+function hasTeacherKeywordInRedContext(text: string, conversationHistory: string): boolean {
+  if (!hasImmediateTeacherKeyword(text)) {
+    return false;
+  }
+
+  const normalized = normalizeSafetyIntentText(text);
+  const teacherMatches = normalized.match(/\bteacher\b/g);
+  const repeatedTeacherRequest = Boolean(teacherMatches && teacherMatches.length >= 2);
+  const urgentTeacherPhrases = [
+    /\bneed (a |the |my )?teacher\b/i,
+    /\btell (a |the |my )?teacher\b/i,
+    /\bget (a |the |my )?teacher\b/i,
+    /\bcall (a |the |my )?teacher\b/i,
+    /\bteacher right now\b/i,
+    /\bi need help\b/i,
+    /\bhelp me now\b/i,
+    /\bi don't feel safe\b/i,
+    /\bnot safe\b/i,
+  ];
+
+  const redEmotionSignals = [
+    /\b(scared|afraid|terrified|panic|unsafe)\b/i,
+    /\b(hurt|hurting|hit|hitting|bleeding|weapon|knife|gun)\b/i,
+    /\b(now|right now|immediately|please)\b/i,
+  ];
+
+  return (
+    repeatedTeacherRequest ||
+    urgentTeacherPhrases.some((pattern) => pattern.test(normalized)) ||
+    redEmotionSignals.some((pattern) => pattern.test(normalized)) ||
+    detectHighRiskContent(text) ||
+    detectHighRiskContent(conversationHistory)
+  );
+}
+
 function hasLonelinessSignal(text: string): boolean {
   const normalized = normalizeSafetyIntentText(text)
     .replace(/\b(lonley|lonly|loney)\b/g, 'lonely')
@@ -145,19 +199,25 @@ export default function App() {
   const [showTeacherDashboard, setShowTeacherDashboard] = useState(false);
   const [teacherAlerts, setTeacherAlerts] = useState<TeacherAlert[]>([]);
   const [teacherDashboardToast, setTeacherDashboardToast] = useState<string | null>(null);
+  const [liveParentSummary, setLiveParentSummary] = useState<ParentSummary | null>(null);
+  const [showLiveParentSummary, setShowLiveParentSummary] = useState(false);
+  const [redEmergencyNotice, setRedEmergencyNotice] = useState<string | null>(null);
   const [studentNotice, setStudentNotice] = useState<string | null>(null);
   const [hideNeedTeacherButton, setHideNeedTeacherButton] = useState(false);
 
   // Audio Context Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const outputGainNodeRef = useRef<GainNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const liveSessionTokenRef = useRef(0);
   const conversationHistoryRef = useRef<string>('');
   const sessionPromiseRef = useRef<any>(null);
   const studentIdRef = useRef<string>('anonymous-student');
+  const studentInfoRef = useRef<StudentInfo>({ id: 'anonymous-student' });
   const isEndingSessionRef = useRef(false);
   const forceTeacherEscalationRef = useRef(false);
   const recentStudentTextRef = useRef('');
@@ -206,11 +266,13 @@ export default function App() {
     const existing = localStorage.getItem(key);
     if (existing) {
       studentIdRef.current = existing;
+      studentInfoRef.current = { id: existing };
       return;
     }
 
     const generated = `student-${Math.random().toString(36).slice(2, 10)}`;
     studentIdRef.current = generated;
+    studentInfoRef.current = { id: generated };
     localStorage.setItem(key, generated);
   }, []);
 
@@ -223,7 +285,9 @@ export default function App() {
       return;
     }
 
-    const refresh = () => setTeacherAlerts(getTeacherAlerts());
+    const refresh = () => {
+      setTeacherAlerts(getTeacherAlerts());
+    };
     refresh();
     const interval = window.setInterval(refresh, 1500);
     return () => window.clearInterval(interval);
@@ -247,9 +311,22 @@ export default function App() {
 
   const stopRealtimeResources = () => {
     if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    activeSourcesRef.current.forEach(s => s.stop());
+    activeSourcesRef.current.forEach((s) => {
+      try {
+        s.onended = null;
+        s.stop(0);
+      } catch {
+        // Ignore DOMException from already stopped sources.
+      }
+      try {
+        s.disconnect();
+      } catch {
+        // Ignore disconnection errors.
+      }
+    });
     activeSourcesRef.current.clear();
     setIsSpeaking(false);
+    nextStartTimeRef.current = 0;
 
     scriptProcessorRef.current?.disconnect();
     scriptProcessorRef.current = null;
@@ -258,10 +335,79 @@ export default function App() {
     mediaStreamRef.current = null;
   };
 
+  const showDashboardToast = (message: string) => {
+    setTeacherDashboardToast(message);
+    window.setTimeout(() => setTeacherDashboardToast(null), 3500);
+  };
+
+  const forceStopVoiceSession = () => {
+    isEndingSessionRef.current = true;
+    liveSessionTokenRef.current += 1;
+    if (outputGainNodeRef.current && outputAudioContextRef.current) {
+      const now = outputAudioContextRef.current.currentTime;
+      outputGainNodeRef.current.gain.cancelScheduledValues(now);
+      outputGainNodeRef.current.gain.setValueAtTime(0, now);
+    }
+    stopRealtimeResources();
+    outputAudioContextRef.current?.suspend().catch(() => {});
+    outputAudioContextRef.current?.close().catch(() => {});
+    outputAudioContextRef.current = null;
+    outputGainNodeRef.current = null;
+    inputAudioContextRef.current?.suspend().catch(() => {});
+    inputAudioContextRef.current?.close().catch(() => {});
+    inputAudioContextRef.current = null;
+    sessionPromiseRef.current?.then((session: any) => session.close()).catch(() => {});
+    sessionPromiseRef.current = null;
+  };
+
+  const generateLiveParentSummary = async (
+    reason: 'CONVERSATION_END' | 'RED_ALERT',
+    conversationOverride?: {
+      studentText: string;
+      turtleSummary: string;
+      urgency: UrgencyLevel;
+      concernType: TurtleResponse['concernType'] | 'emotional_regulation';
+      escalationType: EscalationType;
+      tags?: string[];
+    },
+  ) => {
+    try {
+      if (conversationOverride) {
+        recordConversationForParentSummary(studentIdRef.current, {
+          timestamp: new Date().toISOString(),
+          studentText: conversationOverride.studentText,
+          turtleSummary: conversationOverride.turtleSummary,
+          urgency: conversationOverride.urgency,
+          concernType: conversationOverride.concernType || 'emotional_regulation',
+          escalationType: conversationOverride.escalationType,
+          tags: conversationOverride.tags || [],
+        });
+      }
+
+      const summary = await generateAndSendParentSummary(studentInfoRef.current);
+      if (!summary) {
+        return;
+      }
+
+      setLiveParentSummary(summary);
+      setShowLiveParentSummary(true);
+      showDashboardToast(
+        reason === 'RED_ALERT'
+          ? `Parent update is now live due to RED alert (${summary.weekCovered}).`
+          : `Parent update is now live (${summary.weekCovered}).`,
+      );
+    } catch {
+      showDashboardToast('Unable to generate parent update right now.');
+    }
+  };
+
   const triggerImmediateTeacherAlert = (summary: string) => {
     if (alertSentThisSessionRef.current) {
       return;
     }
+
+    // Stop audio and close the live session immediately before any blocking UI alert.
+    forceStopVoiceSession();
 
     const alert: TeacherAlert = {
       timestamp: new Date().toISOString(),
@@ -279,8 +425,35 @@ export default function App() {
     markEscalation(studentIdRef.current, EscalationType.IMMEDIATE);
     setTeacherAlerts(getTeacherAlerts());
     setTeacherContactStatus('Teacher has been notified to check in privately.');
-    window.alert('New teacher alert created. Please check in with the student now.');
+    setStudentNotice('Teacher has been notified to check in privately.');
+    setRedEmergencyNotice('RED Zone: Teacher has been notified. Please wait for support.');
+    setState((prev) => ({
+      ...prev,
+      step: 'RESULTS',
+      response: {
+        sufficient: true,
+        shouldEndConversation: true,
+        closingMessage: 'I heard a big safety concern. A teacher is coming to help now.',
+        listeningHealing: 'A teacher is coming to help now.',
+        reflectionHelper: '',
+        exercise: { task: 'Stay where you are and take slow breaths.', reward: 'Safety First' },
+        summary: 'Immediate teacher support requested.',
+        urgency: UrgencyLevel.RED,
+        escalationType: EscalationType.IMMEDIATE,
+        concernType: 'emotional_regulation',
+        needsEscalationConfirmation: false,
+      },
+    }));
     alertSentThisSessionRef.current = true;
+
+    void generateLiveParentSummary('RED_ALERT', {
+      studentText: recentStudentTextRef.current || summary,
+      turtleSummary: summary,
+      urgency: UrgencyLevel.RED,
+      concernType: 'emotional_regulation',
+      escalationType: EscalationType.IMMEDIATE,
+      tags: ['urgent-support'],
+    });
   };
 
   const startVoiceSession = async (customGreeting?: string, resumedFromYellow = false) => {
@@ -293,6 +466,8 @@ export default function App() {
     setStudentNotice(null);
     setHideNeedTeacherButton(resumedFromYellow);
     try {
+      const sessionToken = liveSessionTokenRef.current + 1;
+      liveSessionTokenRef.current = sessionToken;
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           echoCancellation: true,
@@ -306,6 +481,9 @@ export default function App() {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      outputGainNodeRef.current = outputAudioContextRef.current.createGain();
+      outputGainNodeRef.current.gain.value = 1;
+      outputGainNodeRef.current.connect(outputAudioContextRef.current.destination);
       nextStartTimeRef.current = 0;
 
       const greeting = customGreeting || "Hey friend! Want to tell me something?";
@@ -329,6 +507,9 @@ export default function App() {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
+            if (sessionToken !== liveSessionTokenRef.current || isEndingSessionRef.current) {
+              return;
+            }
             // SPEECH FIRST: Force the initial greeting immediately on open
             sessionPromiseRef.current.then((session: any) => {
               session.send({
@@ -373,6 +554,9 @@ export default function App() {
             resetSilenceTimer();
           },
           onmessage: async (message: LiveServerMessage) => {
+            if (sessionToken !== liveSessionTokenRef.current) {
+              return;
+            }
             if (isEndingSessionRef.current) {
               return;
             }
@@ -382,9 +566,15 @@ export default function App() {
               conversationHistoryRef.current += ' Student: ' + childText;
               recentStudentTextRef.current = `${recentStudentTextRef.current} ${childText}`.slice(-600);
               resetSilenceTimer();
+              const stopCandidate = `${childText} ${recentStudentTextRef.current}`;
+
+              if (hasTeacherKeywordInRedContext(stopCandidate, conversationHistoryRef.current)) {
+                forceTeacherEscalationRef.current = true;
+                triggerImmediateTeacherAlert('Student requested teacher in a high-urgency context during voice chat.');
+                return;
+              }
 
               const patterns = getStudentPatterns(studentIdRef.current);
-              const stopCandidate = `${childText} ${recentStudentTextRef.current}`;
               const liveEscalation = determineEscalation(stopCandidate, conversationHistoryRef.current, patterns);
               const shouldLogYellowNow = liveEscalation === EscalationType.PATTERN || hasLonelinessSignal(childText);
 
@@ -406,13 +596,13 @@ export default function App() {
                 markEscalation(studentIdRef.current, EscalationType.PATTERN);
                 setTeacherAlerts(getTeacherAlerts());
                 setStudentNotice('Teacher notified for a gentle check-in. You can keep talking to Turtle.');
+                setHideNeedTeacherButton(true);
                 yellowAlertSentThisSessionRef.current = true;
               }
 
               if (shouldForceTeacherEscalation(stopCandidate, conversationHistoryRef.current, patterns)) {
                 forceTeacherEscalationRef.current = true;
                 triggerImmediateTeacherAlert('Student asked for teacher support during voice chat.');
-                endVoiceSession();
                 return;
               }
 
@@ -420,6 +610,7 @@ export default function App() {
                 if (hasTeacherHelpIntent(stopCandidate)) {
                   forceTeacherEscalationRef.current = true;
                   triggerImmediateTeacherAlert('Student requested teacher support.');
+                  return;
                 }
                 endVoiceSession();
                 return;
@@ -433,16 +624,33 @@ export default function App() {
 
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio) {
+              if (sessionToken !== liveSessionTokenRef.current) {
+                return;
+              }
+              if (isEndingSessionRef.current) {
+                return;
+              }
               setIsSpeaking(true);
-              const ctx = outputAudioContextRef.current!;
+              const ctx = outputAudioContextRef.current;
+              if (!ctx) {
+                return;
+              }
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
               const buffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
+              if (sessionToken !== liveSessionTokenRef.current) {
+                return;
+              }
+              if (isEndingSessionRef.current) {
+                return;
+              }
               const source = ctx.createBufferSource();
               source.buffer = buffer;
-              source.connect(ctx.destination);
+              const outputNode = outputGainNodeRef.current || ctx.destination;
+              source.connect(outputNode);
+              // Track source before start so emergency stop cannot miss it.
+              activeSourcesRef.current.add(source);
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += buffer.duration;
-              activeSourcesRef.current.add(source);
               source.onended = () => {
                 activeSourcesRef.current.delete(source);
                 if (activeSourcesRef.current.size === 0) {
@@ -453,6 +661,9 @@ export default function App() {
             }
           },
           onerror: (e: ErrorEvent) => {
+            if (sessionToken !== liveSessionTokenRef.current) {
+              return;
+            }
             console.error('Turtle API Error:', e);
             setError("Turtle is having a little trouble hearing. Let's try again!");
             resetSession();
@@ -493,6 +704,18 @@ export default function App() {
     try {
       const patterns = getStudentPatterns(studentIdRef.current);
       const response = await getTurtleSupport(text, conversationHistoryRef.current || text, patterns, studentIdRef.current);
+      recordConversationForParentSummary(studentIdRef.current, {
+        timestamp: new Date().toISOString(),
+        studentText: text,
+        turtleSummary: response.summary || response.listeningHealing || '',
+        urgency: response.urgency || UrgencyLevel.GREEN,
+        concernType: response.concernType || 'emotional_regulation',
+        escalationType: response.escalationType || EscalationType.NONE,
+        tags: response.tags || [],
+      });
+
+      await generateLiveParentSummary('CONVERSATION_END');
+
       const transcriptRequestsTeacher = hasTeacherHelpIntent(text) || hasTeacherHelpIntent(conversationHistoryRef.current || '');
       const shouldAutoNotifyTeacher =
         forceTeacherEscalationRef.current ||
@@ -539,6 +762,21 @@ export default function App() {
     }
   };
 
+  const generateSummaryNow = async () => {
+    try {
+      const summary = await generateAndSendParentSummary(studentInfoRef.current);
+      if (!summary) {
+        showDashboardToast('Parent update skipped: no eligible conversations or parent contact is disabled.');
+        return;
+      }
+      setLiveParentSummary(summary);
+      setShowLiveParentSummary(true);
+      showDashboardToast(`Parent update generated for ${summary.weekCovered}.`);
+    } catch {
+      showDashboardToast('Unable to generate parent update right now.');
+    }
+  };
+
   const resetSession = () => {
     isEndingSessionRef.current = false;
     forceTeacherEscalationRef.current = false;
@@ -554,7 +792,9 @@ export default function App() {
     setNeedsEscalationConfirmation(false);
     setTeacherContactStatus(null);
     setStudentNotice(null);
+    setRedEmergencyNotice(null);
     setHideNeedTeacherButton(false);
+    setShowLiveParentSummary(false);
     conversationHistoryRef.current = '';
   };
 
@@ -591,9 +831,53 @@ export default function App() {
 
   return (
     <div className="min-h-screen px-4 py-10 md:px-12 md:py-16 flex flex-col items-center">
+      {redEmergencyNotice && (
+        <div className="fixed inset-0 z-[60] bg-[var(--blush-rose)]/90 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="max-w-2xl w-full bg-white rounded-[1.5rem] p-8 border-4 border-[var(--soft-coral)] shadow-2xl text-center">
+            <h2 className="text-4xl font-bubble text-[var(--soft-coral)] mb-4">Teacher Notified</h2>
+            <p className="text-2xl text-[var(--text-cocoa)] mb-6">{redEmergencyNotice}</p>
+            <button
+              onClick={() => setRedEmergencyNotice(null)}
+              className="bubbly-button bg-[var(--soft-coral)] text-white text-2xl px-8 py-4"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      )}
       {showTeacherDashboard && teacherDashboardToast && (
         <div className="fixed top-6 right-6 z-50 bg-[var(--soft-coral)] text-white px-6 py-4 rounded-[1.25rem] shadow-2xl border-2 border-white">
           <p className="text-xl font-bubble">{teacherDashboardToast}</p>
+        </div>
+      )}
+      {showLiveParentSummary && liveParentSummary && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-xl w-[calc(100%-3rem)] sm:w-[34rem] bg-white border-4 border-[var(--sky-blue)] rounded-[1.5rem] shadow-2xl p-5">
+          <div className="flex items-start justify-between gap-4 mb-2">
+            <h3 className="text-2xl font-bubble text-[var(--text-cocoa)]">Parent Update Live</h3>
+            <button
+              onClick={() => setShowLiveParentSummary(false)}
+              className="bubbly-button bg-[var(--soft-coral)] text-white text-base px-3 py-1"
+            >
+              Close
+            </button>
+          </div>
+          <p className="text-sm text-[var(--text-clay)] mb-2">
+            Week: {liveParentSummary.weekCovered}
+          </p>
+          <div className="rounded-xl bg-[var(--mint-calm)]/30 p-3 mb-2">
+            <p className="text-sm font-semibold text-[var(--text-cocoa)] mb-1">📚 Reading Materials</p>
+            <p className="text-sm text-[var(--text-clay)]">{liveParentSummary.readingMaterial.title}</p>
+          </div>
+          <div className="rounded-xl bg-[var(--warm-butter)]/20 p-3 mb-2">
+            <p className="text-sm font-semibold text-[var(--text-cocoa)] mb-1">🧩 Activities & Book Recommendations</p>
+            <p className="text-sm text-[var(--text-clay)]">
+              {liveParentSummary.activities.slice(0, 2).map((item) => item.title).join(' • ')}
+            </p>
+          </div>
+          <div className="rounded-xl bg-[var(--gentle-leaf)]/20 p-3">
+            <p className="text-sm font-semibold text-[var(--text-cocoa)] mb-1">🌱 Growth Moments Report</p>
+            <p className="text-sm text-[var(--text-clay)]">{liveParentSummary.growthMoment.headline}</p>
+          </div>
         </div>
       )}
       <header className="flex flex-col items-center mb-12 text-center">
@@ -621,7 +905,15 @@ export default function App() {
       <main className="w-full max-w-4xl flex flex-col items-center">
         {showTeacherDashboard && (
           <div className="w-full max-w-4xl bubbly-card bg-white p-8 md:p-10">
-            <h2 className="text-4xl font-bubble text-[var(--text-cocoa)] mb-6">Teacher Alerts</h2>
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+              <h2 className="text-4xl font-bubble text-[var(--text-cocoa)]">Teacher Alerts</h2>
+              <button
+                onClick={() => generateSummaryNow()}
+                className="bubbly-button bg-[var(--gentle-leaf)] text-white text-xl px-6 py-3"
+              >
+                ✓ Send Parent Update
+              </button>
+            </div>
             {teacherAlerts.length === 0 ? (
               <p className="text-2xl text-[var(--text-clay)]">No alerts yet.</p>
             ) : (
@@ -770,9 +1062,49 @@ export default function App() {
                 }
               </p>
               {state.response.sufficient && (
-                <p className="text-2xl text-[var(--text-clay)] font-medium">Choose a card to see what we found:</p>
+                <p className="text-2xl text-[var(--text-clay)] font-medium">Here is a summary of the conversation</p>
               )}
             </div>
+
+            {liveParentSummary && (
+              <div className="w-full max-w-3xl bg-white bubbly-card p-8 border-4 border-[var(--sky-blue)]">
+                <h3 className="text-4xl font-bubble text-[var(--text-cocoa)] mb-2">Parent Summary Dashboard</h3>
+                <p className="text-base text-[var(--text-clay)] mb-3">
+                  Week: {liveParentSummary.weekCovered}
+                </p>
+                <div className="rounded-[1.25rem] border-2 border-[var(--sky-blue)] p-5 mb-4 bg-[var(--mint-calm)]/25">
+                  <h4 className="text-2xl font-bubble text-[var(--text-cocoa)] mb-2">📚 Reading Materials</h4>
+                  <p className="text-lg text-[var(--text-cocoa)] mb-2">{liveParentSummary.readingMaterial.title}</p>
+                  <p className="text-base text-[var(--text-clay)] mb-2">{liveParentSummary.readingMaterial.intro}</p>
+                  <p className="text-base text-[var(--text-clay)] mb-2">{liveParentSummary.readingMaterial.quickRead}</p>
+                  <p className="text-base text-[var(--text-clay)]">Script: "{liveParentSummary.readingMaterial.parentScript}"</p>
+                </div>
+
+                <div className="rounded-[1.25rem] border-2 border-[var(--warm-butter)] p-5 mb-4 bg-[var(--warm-butter)]/20">
+                  <h4 className="text-2xl font-bubble text-[var(--text-cocoa)] mb-2">🧩 Activities & Book Recommendations</h4>
+                  <p className="text-base text-[var(--text-clay)] mb-1">
+                    {liveParentSummary.activities
+                      .slice(0, 3)
+                      .map((item) => `${item.title} (${item.durationMinutes} min)`)
+                      .join(' • ')}
+                  </p>
+                  <p className="text-base text-[var(--text-clay)]">
+                    {liveParentSummary.bookRecommendations
+                      .map((book) => `${book.title} by ${book.author} (${book.ratingOutOf5.toFixed(1)}/5)`)
+                      .join(' • ')}
+                  </p>
+                </div>
+
+                <div className="rounded-[1.25rem] border-2 border-[var(--gentle-leaf)] p-5 bg-[var(--gentle-leaf)]/20">
+                  <h4 className="text-2xl font-bubble text-[var(--text-cocoa)] mb-2">🌱 Growth Moments Report</h4>
+                  <p className="text-xl text-[var(--text-cocoa)] mb-2">{liveParentSummary.growthMoment.headline}</p>
+                  <p className="text-base text-[var(--text-clay)] mb-2">{liveParentSummary.growthMoment.celebration}</p>
+                  <p className="text-base text-[var(--text-clay)]">
+                    {liveParentSummary.growthMoment.brightSpots.join(' • ')}
+                  </p>
+                </div>
+              </div>
+            )}
 
             {state.response.shouldEndConversation ? (
               <div className="bg-[var(--gentle-leaf)] bubbly-card p-10 text-center w-full max-w-2xl">
@@ -859,55 +1191,11 @@ export default function App() {
               </div>
             )}
 
-            {state.response.urgency === UrgencyLevel.RED && !needsEscalationConfirmation && (
-              <div className="bg-[var(--blush-rose)] bubbly-card p-12 mt-12 w-full max-w-2xl animate-in zoom-in duration-500">
-                <h3 className="text-5xl font-bubble text-white mb-6 text-center">Wait! 🆘</h3>
-                <p className="text-2xl text-white mb-8 font-medium text-center leading-relaxed">
-                  This sounds like a very big worry. It's best to talk to a teacher you trust right away.
-                </p>
-                <div className="bg-white/90 p-10 rounded-[2.5rem] mb-10 text-2xl text-[var(--text-cocoa)] italic font-bubble text-center">
-                  "{state.response.helpInstruction}"
-                </div>
-                <div className="flex gap-6">
-                  <button
-                    onClick={() => {
-                      if (state.response) {
-                        const alert = generateTeacherAlert(state.response, true);
-                        saveTeacherAlert(alert);
-                        markEscalation(studentIdRef.current, state.response.escalationType || EscalationType.IMMEDIATE);
-                        setTeacherAlerts(getTeacherAlerts());
-                        window.alert('New teacher alert created. Please check in with the student now.');
-                        setTeacherContactStatus('Teacher has been notified to check in privately.');
-                      }
-                    }}
-                    className="flex-1 bubbly-button bg-white text-[var(--soft-coral)] text-3xl font-bubble py-6 shadow-md hover:bg-white/100"
-                  >
-                    I will talk to a teacher
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (state.response) {
-                        logInternalConcern(
-                          studentIdRef.current,
-                          state.response.summary || 'Student deferred teacher outreach.',
-                          state.response.escalationType || EscalationType.IMMEDIATE,
-                        );
-                        setTeacherContactStatus('Okay. We will not notify a teacher right now.');
-                      }
-                    }}
-                    className="flex-1 bubbly-button bg-[var(--soft-coral)] border-4 border-white text-white text-3xl font-bubble py-6"
-                  >
-                    Not now
-                  </button>
-                </div>
-              </div>
-            )}
-
             <div className="mt-12 flex flex-col sm:flex-row gap-4">
               {state.response.urgency === UrgencyLevel.YELLOW && (
                 <button
                   onClick={resumeConversation}
-                  className="bubbly-button bg-[var(--sky-blue)] text-white text-3xl font-bubble py-5 px-16 transition-all hover:opacity-90"
+                  className="bubbly-button bg-blue-700 hover:bg-blue-800 text-white text-3xl font-bubble py-5 px-16 transition-all"
                 >
                   Keep Talking to Turtle
                 </button>
